@@ -1,0 +1,86 @@
+{
+  "executive_summary": "A recent deployment of the 'rebalance' service introduced a critical database connection leak, leading to the exhaustion of application connection pools and PostgreSQL connection limits. This resulted in widespread 5xx errors and a full outage of the API service, severely impacting all customer-facing operations. The primary fix involves rolling back the problematic deployment to restore service stability.",
+  "best_solution": "Rollback deployment 2026.03.17-2 of the `api-service` (containing `rebalance_service.py`) to the previous stable version.",
+  "selection_rationale": "The incident diagnosis definitively links the service outage to a database connection leak introduced by the latest deployment of the `rebalance` service. Rolling back to the immediately preceding, known-stable version is the safest, fastest, and most direct way to eliminate the root cause of the leak and restore service. While other solutions offer temporary mitigations or long-term architectural improvements, only a rollback will stop the connection leak at its source during an active outage, adhering to the principle of prioritizing reverting bad deployments.",
+  "pre_checks": [
+    {
+      "step": 1,
+      "action": "Verify the current problematic deployment version and identify the previous stable version.",
+      "command": "kubectl rollout history deployment/api-service | head -n 5",
+      "expected": "You should see the current problematic revision (e.g., 2026.03.17-2) as the latest and a previous, stable revision (e.g., 2026.03.17-1) to which to roll back."
+    },
+    {
+      "step": 2,
+      "action": "Check the current number of active database connections to confirm high utilization.",
+      "command": "psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -c \"SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle';\"",
+      "expected": "A high number of active connections, potentially near `max_connections` limit for your PostgreSQL instance."
+    },
+    {
+      "step": 3,
+      "action": "Verify application health status remains critical (5xx errors, unresponsiveness).",
+      "command": "curl -s -o /dev/null -w \"%{http_code}\n\" https://api.example.com/api/v1/healthz",
+      "expected": "Expected to still see 5xx status codes (e.g., 502, 504) or connection refused errors."
+    }
+  ],
+  "remediation_steps": [
+    {
+      "step": 1,
+      "action": "Rollback the `api-service` deployment to the last known good revision. Replace `<PREVIOUS_GOOD_REVISION_NUMBER>` with the actual revision ID from pre-check step 1.",
+      "command": "kubectl rollout undo deployment/api-service --to-revision=<PREVIOUS_GOOD_REVISION_NUMBER>",
+      "note": "If using a CI/CD pipeline, trigger a rollback or redeploy of the previous stable version through your standard deployment process."
+    },
+    {
+      "step": 2,
+      "action": "Monitor the rollback progress and ensure new pods are spinning up successfully.",
+      "command": "kubectl rollout status deployment/api-service",
+      "note": "Wait for the command to report 'deployment \"api-service\" successfully rolled out'."
+    },
+    {
+      "step": 3,
+      "action": "Force a restart of the application pods if the rollback doesn't automatically recycle all connections and processes. This ensures any lingering connections from the buggy version are terminated.",
+      "command": "kubectl delete pod -l app=api-service",
+      "note": "This will cause a brief, additional service interruption as pods restart, but is crucial to clear any potentially stuck connections or processes. Only perform if service is not recovering as expected after `rollout undo`."
+    }
+  ],
+  "validation_steps": [
+    {
+      "step": 1,
+      "action": "Monitor application logs for the absence of 'suspected session leak' or 'connection timed out' warnings.",
+      "command": "kubectl logs -l app=api-service --since=5m | grep -E 'session leak|connection timed out|psycopg2.OperationalError' | wc -l",
+      "expected": "Output should be 0, indicating no new connection leak or timeout errors."
+    },
+    {
+      "step": 2,
+      "action": "Verify Nginx access logs for a return to 200/202 status codes and absence of 5xx errors.",
+      "command": "tail -n 100 /var/log/nginx/access.log | grep -E 'HTTP/(1.1|2.0)\" (502|504|500)' | wc -l",
+      "expected": "Output should be 0 or trending towards 0, indicating successful requests."
+    },
+    {
+      "step": 3,
+      "action": "Check the current number of active database connections to confirm a reduction and stable state.",
+      "command": "psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -c \"SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle';\"",
+      "expected": "The number of active connections should drop significantly and stabilize at a healthy level, well below `max_connections`."
+    },
+    {
+      "step": 4,
+      "action": "Perform end-to-end health checks on critical API endpoints.",
+      "command": "curl -s -o /dev/null -w \"%{http_code}\n\" https://api.example.com/api/v1/healthz && curl -s -o /dev/null -w \"%{http_code}\n\" https://api.example.com/api/v1/portfolio/summary",
+      "expected": "Both commands should return 200 OK."
+    }
+  ],
+  "rollback_notes": [
+    "If the `kubectl rollout undo` command fails or the service does not recover, immediately re-rollout the problematic version (if it was partially deployed) or escalate to the development team for an emergency hotfix.",
+    "If the rollback itself introduces new issues (e.g., the previous version is also unstable for another reason), a quick assessment is needed to decide between re-deploying the current problematic version (if it's less severe) or working with development on a rapid hotfix."
+  ],
+  "secondary_actions": [
+    "Conduct a post-mortem analysis to fully understand the root cause of the connection leak and implement robust testing to prevent recurrence.",
+    "Implement enhanced metrics and alerting for SQLAlchemy connection pool usage and PostgreSQL active connections.",
+    "Review and potentially refactor the `rebalance_service.py` module to ensure proper database session management (e.g., using context managers, `try...finally` blocks for `session.close()`).",
+    "Evaluate the feasibility of deploying PgBouncer or a similar connection pooler as a permanent architectural improvement to abstract database connection management from the application."
+  ],
+  "incident_classification": {
+    "severity": "P1",
+    "category": "Application Bug / Database Connectivity",
+    "likely_trigger": "Deployment of `portfolio/rebalance_service.py` (version 2026.03.17-2)"
+  }
+}

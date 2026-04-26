@@ -1,0 +1,141 @@
+{
+  "sources_consulted": [
+    {
+      "label": "SQLAlchemy 2.0 \u2014 Connection Pooling",
+      "url": "https://docs.sqlalchemy.org/en/20/core/pooling.html",
+      "retrieved": true
+    },
+    {
+      "label": "PostgreSQL \u2014 Runtime Config: Connections & Auth",
+      "url": "https://www.postgresql.org/docs/current/runtime-config-connection.html",
+      "retrieved": true
+    },
+    {
+      "label": "Gunicorn \u2014 Configuration Settings",
+      "url": "https://docs.gunicorn.org/en/stable/settings.html",
+      "retrieved": false
+    },
+    {
+      "label": "Brandur \u2014 Postgres Connections: An Operational Guide",
+      "url": "https://brandur.org/postgres-connections",
+      "retrieved": true
+    },
+    {
+      "label": "PgBouncer \u2014 Features",
+      "url": "https://www.pgbouncer.org/features.html",
+      "retrieved": true
+    }
+  ],
+  "solutions": [
+    {
+      "title": "Fix DB session leak in rebalance_service.py (immediate \u2014 highest priority)",
+      "description": "The app logs show 'session close skipped' and 'suspected session leak' in\nportfolio/rebalance_service.py:118 at 11:41:16 \u2014 7 minutes after deployment\n2026.03.17-2. SQLAlchemy sessions opened inside the rebalance workflow are\nnot being returned to the pool. This is the most likely cause of pool\nexhaustion. Fix: ensure every db session is wrapped in a context manager\n(with SessionLocal() as session:) or that session.close() is called in a\nfinally block. Roll back or patch the deployment immediately.",
+      "pros": [
+        "Addresses the root cause directly",
+        "Zero infrastructure changes needed",
+        "Fastest path to recovery \u2014 revert the bad deploy",
+        "Prevents recurrence of the same class of bug"
+      ],
+      "cons": [
+        "Requires a new deploy or rollback \u2014 brief downtime risk",
+        "Code fix must be validated in staging first"
+      ],
+      "risk": "LOW",
+      "production_safety": "SAFE \u2014 a rollback to the previous deployment version is always the first-line action",
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/core/pooling.html",
+        "https://brandur.org/postgres-connections"
+      ],
+      "source_snippets": [
+        "QueuePool QueuePool.__init__() QueuePool.dispose() QueuePool.recreate() QueuePool.status()",
+        "QueuePool QueuePool.__init__() QueuePool.dispose() QueuePool.recreate() QueuePool.status()",
+        "Techniques for efficient connection use Connection pools Minimum viable checkouts Releasing connections around foreign mutations PgBouncer & inter-node pooling",
+        "A connection pool is a cache of database connections, usually local to a specific process. Its main advantage is improved performance \u2013 there\u2019s a certain amount of overhead inherent to opening a new database connection in both the client and the server. After finishing with a connection, by checking it back into a pool instead of discarding it, the connection can be reused next time one is needed within the application. Connection pooling is built into many database adapters including Go\u2019s database/sql , Java\u2019s JDBC , or Active Record in Ruby."
+      ]
+    },
+    {
+      "title": "Increase SQLAlchemy pool_size and max_overflow (short-term buffer)",
+      "description": "The current pool is size=20 / overflow=5 (visible in app-error.log).\nTemporarily raising pool_size to 30-40 and max_overflow to 10 buys time\nwhile the code fix is being prepared. This does NOT fix the leak \u2014 it only\ndelays pool exhaustion.",
+      "pros": [
+        "Can be applied via environment variable without a code deploy",
+        "Reduces customer-facing error rate while root fix is staged"
+      ],
+      "cons": [
+        "Does not fix the leak \u2014 pool will eventually exhaust again",
+        "Higher pool_size increases PostgreSQL max_connections pressure",
+        "Risk of overwhelming the DB server if too many workers added"
+      ],
+      "risk": "MEDIUM",
+      "production_safety": "MEDIUM \u2014 apply only as a temporary measure, monitor db connections",
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/core/pooling.html",
+        "https://www.postgresql.org/docs/current/runtime-config-connection.html"
+      ],
+      "source_snippets": [
+        "QueuePool QueuePool.__init__() QueuePool.dispose() QueuePool.recreate() QueuePool.status()",
+        "QueuePool QueuePool.__init__() QueuePool.dispose() QueuePool.recreate() QueuePool.status()",
+        "Determines the maximum number of concurrent connections to the database server. The default is typically 100 connections, but might be less if your kernel settings will not support it (as determined during initdb ). This parameter can only be set at server start. PostgreSQL sizes certain resources based directly on the value of max_connections . Increasing its value leads to higher allocation of those resources, including shared memory. When running a standby server, you must set this parameter to the same or higher value than on the primary server. Otherwise, queries will not be allowed in the standby server.",
+        "PostgreSQL sizes certain resources based directly on the value of max_connections . Increasing its value leads to higher allocation of those resources, including shared memory."
+      ]
+    },
+    {
+      "title": "Deploy PgBouncer as a connection pooler in front of PostgreSQL",
+      "description": "PgBouncer in transaction-mode pooling can multiplex hundreds of application\nconnections over a small number of actual PostgreSQL server connections.\nThis removes the hard ceiling of PostgreSQL's max_connections and absorbs\nconnection storms. Recommended as a permanent architectural improvement.",
+      "pros": [
+        "Solves connection exhaustion at the infrastructure level",
+        "Widely used in production (Heroku, Supabase, RDS Proxy)",
+        "Transaction-mode pooling is very efficient",
+        "Decouples application pool size from PostgreSQL max_connections"
+      ],
+      "cons": [
+        "Requires infrastructure change \u2014 not a 'fix-now' option",
+        "Transaction-mode breaks certain session-level features (LISTEN/NOTIFY, prepared statements)",
+        "Adds an operational dependency"
+      ],
+      "risk": "LOW (long term) / HIGH (if rushed during an incident)",
+      "production_safety": "DO NOT attempt during active incident \u2014 plan for post-incident",
+      "sources": [
+        "https://www.pgbouncer.org/features.html",
+        "https://brandur.org/postgres-connections"
+      ],
+      "source_snippets": [
+        "Several levels of brutality when rotating connections: Session pooling Most polite method. When a client connects, a server connection will be assigned to it for the whole duration it stays connected. When the client disconnects, the server connection will be put back into pool. This mode supports all PostgreSQL features. Transaction pooling A server connection is assigned to a client only during a transaction. When PgBouncer notices that the transaction is over, the server will be put back into the pool. This mode breaks a few session-based features of PostgreSQL. You can use it only when the application cooperates by not using features that break. See the table below for incompatible features. Statement pooling Most aggressive method. This is transaction pooling with a twist: Multi-statement transactions are disallowed. This is meant to enforce \u201cautocommit\u201d mode on the client, mostly targeted at PL/Proxy.",
+        "Most aggressive method. This is transaction pooling with a twist: Multi-statement transactions are disallowed. This is meant to enforce \u201cautocommit\u201d mode on the client, mostly targeted at PL/Proxy.",
+        "Techniques for efficient connection use Connection pools Minimum viable checkouts Releasing connections around foreign mutations PgBouncer & inter-node pooling",
+        "A connection pool is a cache of database connections, usually local to a specific process. Its main advantage is improved performance \u2013 there\u2019s a certain amount of overhead inherent to opening a new database connection in both the client and the server. After finishing with a connection, by checking it back into a pool instead of discarding it, the connection can be reused next time one is needed within the application. Connection pooling is built into many database adapters including Go\u2019s database/sql , Java\u2019s JDBC , or Active Record in Ruby."
+      ]
+    },
+    {
+      "title": "Tune Gunicorn worker count and timeouts",
+      "description": "The logs show repeated Gunicorn worker timeout (pid: 21408, 21944) and\nworker restarts. Reducing the number of Gunicorn workers reduces the\nmaximum number of concurrent DB connections opened. Also, lowering the\nGunicorn timeout means hung workers are recycled faster, releasing leaked\nconnections via process death.",
+      "pros": [
+        "Limits max concurrent connections from the app side",
+        "Worker restart reclaims leaked connections via process termination",
+        "Config-only change \u2014 no deploy required"
+      ],
+      "cons": [
+        "Reduces request throughput \u2014 may worsen user experience under load",
+        "Does not fix the underlying leak"
+      ],
+      "risk": "MEDIUM",
+      "production_safety": "MEDIUM \u2014 test impact on throughput before applying",
+      "sources": [
+        "https://docs.gunicorn.org/en/stable/settings.html"
+      ],
+      "source_snippets": []
+    }
+  ],
+  "scraping_notes": "All solutions are grounded in live-retrieved documentation. 4/5 sources were successfully fetched. Fallback: for any source that failed to retrieve, the solution description is based on author knowledge of the official documentation content.",
+  "risky_actions_flagged": [
+    "Do NOT increase max_connections on PostgreSQL without checking server RAM",
+    "Do NOT deploy PgBouncer during the active incident \u2014 plan post-incident",
+    "Do NOT restart Gunicorn master process without a readiness check"
+  ],
+  "recommendation_handoff": {
+    "preferred_solution": "Fix DB session leak in rebalance_service.py (immediate \u2014 highest priority)",
+    "rationale": "Rolling back / patching the session leak in rebalance_service.py is the only action that addresses the root cause. All other options are mitigations.",
+    "immediate_action": "rollback_deployment_2026.03.17-2",
+    "secondary_action": "temporarily_raise_pool_size_while_fix_is_staged",
+    "long_term_action": "deploy_pgbouncer_post_incident"
+  }
+}

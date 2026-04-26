@@ -1,0 +1,127 @@
+{
+  "suspected_root_cause": "A recent deployment of the 'rebalance' service introduced a database connection leak, leading to SQLAlchemy connection pool exhaustion, PostgreSQL connection refusal, and subsequent application worker timeouts and crashes.",
+  "detailed_analysis": "The incident began shortly after a deployment of the `portfolio/rebalance_service.py` module. Application logs show a rapid increase in SQLAlchemy connection pool usage, quickly leading to pool exhaustion and timeouts for acquiring new database sessions. This cascade resulted in PostgreSQL refusing new connections ('FATAL: remaining connection slots are reserved...'). Gunicorn workers subsequently timed out and crashed, manifesting as 502/504 errors in Nginx and eventually 'Connection refused' as the application became completely unresponsive. Explicit warnings about 'suspected session leak' and 'connections not returning to pool after rebalance requests' strongly support this conclusion.",
+  "evidence": [
+    {
+      "log_file": "app-error.log",
+      "line": "2026-03-17 11:40:56,117 WARN  [sqlalchemy.pool.impl.QueuePool] Connection pool usage high checked_out=20 overflow=5 pool_size=20 max_overflow=5",
+      "significance": "Indicates the SQLAlchemy connection pool reached its absolute limit, signaling resource contention for database connections."
+    },
+    {
+      "log_file": "app-error.log",
+      "line": "2026-03-17 11:41:02,902 ERROR [sqlalchemy.pool.impl.QueuePool] QueuePool limit of size 20 overflow 5 reached, connection timed out, timeout 30.00",
+      "significance": "The first explicit error from the application, confirming that requests are timing out while waiting for a database connection."
+    },
+    {
+      "log_file": "nginx-error.log",
+      "line": "2026/03/17 11:41:04 [error] 18420#18420: *8821 upstream timed out (110: Connection timed out) while reading response header from upstream, client: 103.87.44.9, server: api.example.internal, request: \"GET /api/v1/portfolio/summary HTTP/1.1\", upstream: \"http://127.0.0.1:8000/api/v1/portfolio/summary\", host: \"api.example.com\", referrer: \"https://client.example.com/dashboard\"",
+      "significance": "Nginx starts reporting upstream timeouts, correlating with the application's internal database connection issues, as the application cannot respond within the allowed time."
+    },
+    {
+      "log_file": "app-error.log",
+      "line": "2026-03-17 11:41:05,118 ERROR [api.db] psycopg2.OperationalError: FATAL: remaining connection slots are reserved for non-replication superuser connections",
+      "significance": "Crucial evidence showing the issue has escalated to the database itself, which is now actively rejecting new connections due to exhaustion."
+    },
+    {
+      "log_file": "app-error.log",
+      "line": "2026-03-17 11:41:17,071 WARN  [api.db] suspected session leak count=23 release_rate_below_threshold=true",
+      "significance": "Directly points to database connection leaks as the cause of pool exhaustion, with a significant number of connections held."
+    },
+    {
+      "log_file": "app-error.log",
+      "line": "2026-03-17 11:42:17,001 WARN  [api.release] recent code path touched db session lifecycle in rebalance workflow",
+      "significance": "Provides a strong hint that the `rebalance` service, recently deployed, is the source of the connection leak due to changes in its database session handling."
+    },
+    {
+      "log_file": "nginx-error.log",
+      "line": "2026/03/17 11:42:36 [error] 18420#18420: *8874 connect() failed (111: Connection refused) while connecting to upstream, client: 117.219.33.80, server: api.example.internal, request: \"POST /api/v1/orders/rebalance HTTP/1.1\", upstream: \"http://127.0.0.1:8000/api/v1/orders/rebalance\", host: \"api.example.com\", referrer: \"https://client.example.com/recommendations\"",
+      "significance": "Indicates the application (Gunicorn/Uvicorn) processes are no longer listening or have completely crashed, a full service outage."
+    },
+    {
+      "log_file": "app-error.log",
+      "line": "2026-03-17 11:44:21,550 WARN  [api.db] db connections not returning to pool after rebalance requests over last 10 minutes",
+      "significance": "Further confirms and reiterates the connection leak, specifically linking it to 'rebalance requests', strengthening the hypothesis about the recent deployment."
+    }
+  ],
+  "confidence": "HIGH",
+  "confidence_reasoning": "Multiple log entries across all three log files consistently point to database connection pool exhaustion, followed by explicit database connection refusal, and application worker failures. The `app-error.log` provides direct warnings about 'suspected session leak' and ties it to a 'recent code path touched db session lifecycle in rebalance workflow' from a recent deployment, making the root cause highly evident.",
+  "timeline": [
+    {
+      "timestamp": "11:34:09",
+      "event": "Deployment of `portfolio/rebalance_service.py` (version 2026.03.17-2) completed."
+    },
+    {
+      "timestamp": "11:40:48",
+      "event": "SQLAlchemy connection pool usage becomes high (`checked_out=18`)."
+    },
+    {
+      "timestamp": "11:40:51",
+      "event": "A 'rebalance' request shows high latency (`latency_ms=8421`)."
+    },
+    {
+      "timestamp": "11:40:56",
+      "event": "SQLAlchemy connection pool reaches full capacity (`checked_out=20 overflow=5`)."
+    },
+    {
+      "timestamp": "11:41:02",
+      "event": "Application starts reporting `sqlalchemy.exc.TimeoutError` due to pool exhaustion, failing to acquire DB sessions."
+    },
+    {
+      "timestamp": "11:41:04",
+      "event": "Nginx starts reporting `504 Gateway Timeout` and `upstream timed out` for application requests."
+    },
+    {
+      "timestamp": "11:41:05",
+      "event": "PostgreSQL begins rejecting new connections with `FATAL: remaining connection slots are reserved...`."
+    },
+    {
+      "timestamp": "11:41:12",
+      "event": "Gunicorn workers begin to time out and exit, leading to Nginx reporting `502 Bad Gateway` and `upstream prematurely closed connection`."
+    },
+    {
+      "timestamp": "11:41:17",
+      "event": "Application logs a 'suspected session leak' with a high count of checked-out connections."
+    },
+    {
+      "timestamp": "11:42:17",
+      "event": "Application explicitly links the connection issue to recent code changes in `rebalance_service.py` affecting DB session lifecycle."
+    },
+    {
+      "timestamp": "11:42:36",
+      "event": "Nginx reports `connect() failed (111: Connection refused)`, indicating the application processes are completely unresponsive."
+    }
+  ],
+  "alternate_hypotheses": [
+    {
+      "hypothesis": "Sudden, overwhelming traffic spike exhausting all resources.",
+      "why_less_likely": "While traffic might have played a role, the explicit warnings about 'suspected session leak' and 'connections not returning to pool after rebalance requests' point to a fundamental application logic flaw rather than just volume. The connection exhaustion would likely be temporary with a traffic spike, but here it persists and leads to deeper database-level refusal and explicit leak detection."
+    },
+    {
+      "hypothesis": "Database server crash or network issues between application and database.",
+      "why_less_likely": "The `FATAL: remaining connection slots are reserved...` error from PostgreSQL indicates the database server is responsive and actively managing its connections, but has exhausted available slots, rather than being down or unreachable. There are no log entries indicating network connectivity issues to the database itself (e.g., host unreachable)."
+    }
+  ],
+  "handoff": {
+    "issue_type": "db_connection_pool_exhaustion_and_leak",
+    "affected_component": "SQLAlchemy QueuePool, PostgreSQL, Python Gunicorn workers, `portfolio/rebalance_service.py` module",
+    "affected_endpoints": [
+      "/api/v1/portfolio/summary",
+      "/api/v1/orders/rebalance",
+      "/api/v1/auth/login",
+      "/api/v1/watchlist",
+      "/api/v1/recommendations",
+      "/api/v1/orders"
+    ],
+    "trigger_event": "Deployment of `portfolio/rebalance_service.py` (version 2026.03.17-2) around 11:34:09.",
+    "keywords": [
+      "SQLAlchemy QueuePool",
+      "connection leak",
+      "psycopg2 OperationalError",
+      "FATAL remaining connection slots",
+      "Gunicorn worker timeout",
+      "rebalance service",
+      "database session lifecycle",
+      "resource exhaustion"
+    ]
+  }
+}
