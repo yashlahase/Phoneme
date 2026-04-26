@@ -67,9 +67,6 @@ Edit `.env` and set your Gemini API key:
 GEMINI_API_KEY=your_key_here
 ```
 
-> **Important**: The key provided in the original brief was reported as leaked by Google.  
-> You must use a fresh key from https://aistudio.google.com/app/apikey
-
 ### 4. Run
 
 ```bash
